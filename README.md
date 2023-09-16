@@ -14,5 +14,3 @@ pandas
 keras
 scikit-learn
 
-# BUGS
-Note that there is currently a bug with the UFO stock and selecting it does not correctly display info.
