@@ -9,10 +9,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import timedelta, datetime
 from keras.models import Sequential
-from keras.layers import LSTM, Dense
+from keras.layers import LSTM, Dense, Dropout
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import mean_absolute_error
+from keras.callbacks import EarlyStopping
 
 # Create a function to plot a graph when a menu option is selected
 def plot_graph():
@@ -51,12 +52,6 @@ menu.pack()
 prediction_label = tk.Label(root, text="", wraplength=400)
 prediction_label.pack()
 
-# Create a FigureCanvasTkAgg widget to display the plot in the GUI
-#fig = Figure(figsize=(16, 6))
-#ax = fig.add_subplot(111)
-#canvas = FigureCanvasTkAgg(fig, master=root)
-#canvas.get_tk_widget().pack()
-
 # Create a button to plot the graph
 plot_button = tk.Button(root, text="Plot Graph", command=plot_graph)
 plot_button.pack()
@@ -70,50 +65,56 @@ canvas.get_tk_widget().pack()
 # Set the window size (adjust the width and height as needed)
 root.geometry("600x400")
 
-
 def get_data(ticker, start_date, end_date):
     data = yf.download(ticker, start=start_date, end=end_date)
-    return data['Close']  # Only keep the 'Close' prices
+    return data[['Open', 'High', 'Low', 'Adj Close']]
 
-def prepare_data(data, n_past=14):
-    data = data.values.reshape(-1, 1)
+def prepare_data(data, n_past=60):
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(data)
     X, y = [], []
     for i in range(n_past, len(scaled_data)):
-        X.append(scaled_data[i-n_past:i, 0])
-        y.append(scaled_data[i, 0])
+        X.append(scaled_data[i-n_past:i])
+        y.append(scaled_data[i, -1])
     return np.array(X), np.array(y), scaler
 
-def build_model(look_back):
+def build_model(input_shape):
     model = Sequential()
-    model.add(LSTM(4, input_shape=(look_back, 1)))
+    model.add(LSTM(100, return_sequences=True, input_shape=input_shape))
+    model.add(Dropout(0.2))
+    model.add(LSTM(100, return_sequences=True))
+    model.add(Dropout(0.2))
+    model.add(LSTM(100))
     model.add(Dense(1))
-    model.compile(loss='mean_squared_error', optimizer='adam')
+    model.compile(optimizer='adam', loss='mean_squared_error')
     return model
 
 def build_and_train_model(X, y):
-    model = build_model(X.shape[1])
-    model.fit(X, y, epochs=100, batch_size=32, verbose=0)
+    model = build_model((X.shape[1], X.shape[2]))
+    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model.fit(X, y, epochs=5, batch_size=32, validation_split=0.2, callbacks=[early_stop], verbose=1)
     return model
 
 def maxProfit_future(prices):
     minPrice = prices[0]
     maxProfit = 0
-    buy_date = None
-    sell_date = None
+    buy_date = 0
+    sell_date = 0
+    potential_buy_date = 0
 
     for i in range(1, len(prices)):
         if prices[i] < minPrice:
             minPrice = prices[i]
-            potential_sell_date = i
+            potential_buy_date = i
 
-        elif prices[i] - minPrice > maxProfit:
-            maxProfit = prices[i] - minPrice
+        current_profit = prices[i] - minPrice
+
+        if current_profit > maxProfit:
+            maxProfit = current_profit
             sell_date = i
-            buy_date = potential_sell_date
+            buy_date = potential_buy_date
 
-    if buy_date is None or sell_date is None:
+    if buy_date == sell_date:
         return None, None, None
 
     percent_return = (prices[sell_date] - prices[buy_date]) / prices[buy_date] * 100
@@ -124,34 +125,46 @@ def make_predictions(etf_selected, ax):
     scaler = scaler_dict[etf_selected]
     today_date = datetime.now().strftime('%Y-%m-%d')
     data = get_data(etf_selected, start_date='2022-05-01', end_date=today_date)
-    data = data.values.reshape(-1, 1)
     scaled_data = scaler.transform(data)
-
-    # Predicting the historical data
     predicted_for_test = []
-    for i in range(14, len(scaled_data)):
-        historical_data = scaled_data[i-14:i].reshape(1, -1, 1)
-        pred = model.predict(historical_data)
-        predicted_for_test.append(scaler.inverse_transform(pred).flatten()[0])
+    predicted_future = []
 
-    # Future Prediction
-    input_data = scaled_data[-14:]
+    # Use 60-day windows for historical prediction
+    for i in range(60, len(scaled_data)):
+        historical_data = scaled_data[i-60:i].reshape(1, 60, 4)
+        pred = model.predict(historical_data)
+
+        inversed_prediction = scaler.inverse_transform(
+            np.concatenate([np.zeros((1, 3)), pred], axis=1))[:, -1]
+        predicted_for_test.append(inversed_prediction[0])
+
+    input_data = scaled_data[-60:]
     current_date = datetime.strptime(today_date, '%Y-%m-%d')
     predicted_future = []
     predicted_dates = []
 
-    for i in range(14):
-        pred = model.predict(input_data.reshape(1, -1, 1))
-        predicted_future.append(scaler.inverse_transform(pred).flatten()[0])
+    for i in range(14):  # Loop to predict the next 14 days
+        if input_data.shape == (60, 4):
+            future_data = input_data.reshape(1, 60, 4)
+        else:
+            print("Insufficient data for prediction. Expected shape (60, 4), got ", input_data.shape)
+            break
+        pred = model.predict(future_data)
 
-        input_data = np.append(input_data.flatten()[1:], pred).reshape(-1, 1)
+        inversed_prediction = scaler.inverse_transform(
+            np.concatenate([np.zeros((1, 3)), pred], axis=1))[:, -1]
+        predicted_future.append(inversed_prediction[0])
+
+        pred_compatible = np.zeros((1, 4))
+        pred_compatible[:, -1] = pred
+
+        input_data = np.concatenate((input_data[1:], pred_compatible.reshape(1, 4)), axis=0)
+
         current_date += timedelta(days=1)
         while current_date.weekday() in [5, 6]:
             current_date += timedelta(days=1)
-
         predicted_dates.append(current_date)
 
-    # Max profit calculation
     buy_date, sell_date, percent_return = maxProfit_future(predicted_future)
 
     if buy_date is not None and sell_date is not None:
@@ -160,18 +173,16 @@ def make_predictions(etf_selected, ax):
                           f"Percent Return: {percent_return:.2f}%"
     else:
         prediction_info = "This is not the best time to buy and sell the stock. " \
-                          "There is no predicted opportunity for profit within the next 14 market days."
+                          "There is no predicted opportunity for profit within the next 60 market days."
 
-    # Update the label with the prediction information
+    # Plot the prediction graph on the specified Matplotlib axis (ax)
     prediction_label.config(text=prediction_info)
-
-    # Plot and update the embedded plot in the GUI
-    ax.plot(data, label='True')
-    ax.plot(np.arange(14, len(data)), predicted_for_test, label='Historical Predicted')
-    ax.plot(np.arange(len(data), len(data) + len(predicted_future)), predicted_future, label='Future Predicted')
+    ax.plot(data.index, data['Adj Close'], label='True')
+    ax.plot(data.index[60:], predicted_for_test, label='Historical Predicted')  # Align with the starting index
+    future_dates = pd.date_range(data.index[-1] + timedelta(days=1), periods=14, freq='B')
+    ax.plot(future_dates, predicted_future, label='Future Predicted')
     ax.legend()
     ax.set_title(f"{etf_selected} Predictions")
-    canvas.draw()
 
 # Start the GUI event loop
 etf_list = ['ARKX', 'UFO', 'ROKT']
@@ -181,7 +192,6 @@ scaler_dict = {}
 for etf in etf_list:
     data = get_data(etf, start_date='2022-01-01', end_date='2023-09-15')
     X, y, scaler = prepare_data(data)
-    X = np.reshape(X, (X.shape[0], X.shape[1], 1))  # Reshape to (batch_size, timesteps, features)
     model = build_and_train_model(X, y)
     model_dict[etf] = model
     scaler_dict[etf] = scaler
